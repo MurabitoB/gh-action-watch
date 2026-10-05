@@ -1,0 +1,14 @@
+{
+  "name": "gh-action-watch",
+  "description": "Claude Code mod that watches GitHub Actions runs in a side pane",
+  "owner": {
+    "name": "MurabitoB"
+  },
+  "plugins": [
+    {
+      "name": "gh-action-watch",
+      "source": "./",
+      "description": "Side pane that live-renders GitHub Actions runs as you trigger them from the session"
+    }
+  ]
+}

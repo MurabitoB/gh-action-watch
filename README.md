@@ -26,11 +26,31 @@ When a run finishes, a toast is shown and a short summary (conclusion, failed jo
 
 ## Install
 
+Prerequisites: the [`gh` CLI](https://cli.github.com), logged in (`gh auth login`), and a Claude Code session started inside the repository you run workflows in.
+
+### From the marketplace (no clone)
+
 ```sh
-claude --plugin-dir /path/to/gh-action-watch
+claude plugin marketplace add MurabitoB/gh-action-watch
+claude plugin install gh-action-watch@gh-action-watch
 ```
 
-Requires the `gh` CLI, logged in, with the session started inside the repository. For GitHub Enterprise Server, log in with `gh auth login --hostname <host>`; the workflow file is read through that repo's own host. This has not been tried against a real GHES.
+Start a new session, then type `/gh-actions`. If the pane opens, it is installed.
+
+### From a local copy
+
+```sh
+git clone https://github.com/MurabitoB/gh-action-watch
+claude --plugin-dir ./gh-action-watch
+```
+
+For GitHub Enterprise Server, log in with `gh auth login --hostname <host>`; the workflow file is read through that repo's own host. This has not been tried against a real GHES.
+
+### Troubleshooting
+
+- The pane does not open by itself: a pane opened by a trigger needs a terminal at least 144 columns wide. `/gh-actions` opens it at any width.
+- `gh error: ...` in the pane: `gh` is not logged in, or the session is not inside the repository.
+- Nothing happens after a command: only commands run through Claude's Bash tool are noticed, not the `!` shell prefix or another terminal.
 
 ## Limits
 
