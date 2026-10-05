@@ -66,3 +66,7 @@ claude plugin test .
 ```
 
 `.github/workflows/sample.yml` and `lint.yml` are sample workflows (branching jobs, a matrix, an optional failure via `-f fail=true`) for trying the pane.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
