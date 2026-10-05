@@ -432,7 +432,11 @@ function follow($: any, source: Source) {
         if (run.status === 'completed' && !reported[`${run.id}:${run.attempt}`]) {
           reported[`${run.id}:${run.attempt}`] = true
           $.ui.toast(`${run.name}: ${run.conclusion}`)
-          await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: summarize(run) }] } })
+          try {
+            await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: summarize(run) }] } })
+          } catch {
+            // a refused append must not mask the run's state in the pane
+          }
         }
       }
       const open = runs.filter(r => r.status !== 'completed')
