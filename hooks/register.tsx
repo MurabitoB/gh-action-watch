@@ -424,6 +424,10 @@ function follow($: any, source: Source) {
       const runs: Run[] = []
       for (const id of [...ids].sort((a, b) => a - b)) runs.push(await fetchRun($, id))
       await update($, watch, () => ({ runs, note: '' }))
+      if (ticks === 1 && source.kind === 'ids') {
+        // runs already finished when picked up were reported before; do not post them again
+        for (const run of runs) if (run.status === 'completed') reported[`${run.id}:${run.attempt}`] = true
+      }
       for (const run of runs) {
         if (run.status === 'completed' && !reported[`${run.id}:${run.attempt}`]) {
           reported[`${run.id}:${run.attempt}`] = true
