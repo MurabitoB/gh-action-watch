@@ -31,6 +31,16 @@ const icon = (status: string, conclusion: string | null) => {
   return '○'
 }
 
+// The glyph's color: green done, red failed, yellow running, gray skipped, dim when waiting.
+const tone = (status: string, conclusion: string | null): string | undefined => {
+  if (status === 'completed') {
+    if (conclusion === 'success') return 'green'
+    if (conclusion === 'skipped' || conclusion === 'cancelled') return 'gray'
+    return 'red'
+  }
+  return status === 'in_progress' ? 'yellow' : undefined
+}
+
 
 type Def = { id: string; label: string; needs: string[]; isMatrix: boolean }
 
@@ -495,6 +505,11 @@ export const register: Register = on => {
     const runs = all.filter(r => picked === 0 || r.id === picked)
     const shown = runs.length > 0 ? runs : all
     const now = await $.clock.now()
+    const mark = (status: string, conclusion: string | null) => (
+      <Text color={tone(status, conclusion)} dimColor={tone(status, conclusion) === undefined}>
+        {icon(status, conclusion)}
+      </Text>
+    )
 
     return (
       <Box flexDirection="column">
@@ -520,7 +535,7 @@ export const register: Register = on => {
             <Box flexDirection="column" marginTop={runIndex > 0 ? 1 : 0}>
               {run && (
                 <Text bold>
-                  {icon(run.status, run.conclusion)} {run.name} #{run.id} ({run.conclusion ?? run.status}){dur(run.startedAt, run.status === 'completed' ? lastEnd(run) : null, now)}
+                  {mark(run.status, run.conclusion)} {run.name} #{run.id} ({run.conclusion ?? run.status}){dur(run.startedAt, run.status === 'completed' ? lastEnd(run) : null, now)}
                 </Text>
               )}
               {run && <Text dimColor>{run.url}</Text>}
@@ -541,7 +556,7 @@ export const register: Register = on => {
                       {stage.map((n, k) => (
                         <Text>
                           {i > 0 ? (k === 0 ? '  ▼ ' : '  │ ') : '    '}
-                          {icon(n.status, n.conclusion)} {n.id}
+                          {mark(n.status, n.conclusion)} {n.id}
                           {n.isMatrix ? ` ⟨matrix ${n.instances.filter(j => j.status === 'completed').length}/${n.instances.length}⟩` : ''}
                           {n.needs.length > 0 ? `  ← ${n.needs.join(', ')}` : ''}
                         </Text>
@@ -558,7 +573,7 @@ export const register: Register = on => {
                   {stage.map(n => (
                     <Box flexDirection="column">
                       <Text bold>
-                        {icon(n.status, n.conclusion)} {n.label}
+                        {mark(n.status, n.conclusion)} {n.label}
                         {n.isMatrix ? ' ⟨matrix⟩' : ''}
                         {n.instances.length === 1 ? dur(n.instances[0].startedAt, n.instances[0].completedAt, now) : ''}
                       </Text>
@@ -571,14 +586,14 @@ export const register: Register = on => {
                             {n.isMatrix && (
                               <Text>
                                 {last ? '  └─ ' : '  ├─ '}
-                                {icon(job.status, job.conclusion)} {job.name}{dur(job.startedAt, job.completedAt, now)}
+                                {mark(job.status, job.conclusion)} {job.name}{dur(job.startedAt, job.completedAt, now)}
                               </Text>
                             )}
                             {showSteps &&
                               job.steps.map(step => (
                                 <Text dimColor={step.status === 'completed' || step.status === 'queued'}>
                                   {n.isMatrix ? (last ? '       ' : '  │    ') : '  '}
-                                  {icon(step.status, step.conclusion)} {step.name}{dur(step.startedAt, step.completedAt, now)}
+                                  {mark(step.status, step.conclusion)} {step.name}{dur(step.startedAt, step.completedAt, now)}
                                 </Text>
                               ))}
                           </Box>
@@ -594,7 +609,7 @@ export const register: Register = on => {
                   {run.failures.map(f => (
                     <Box flexDirection="column">
                       <Text bold>
-                        ✗ {f.job} / {f.step}
+                        <Text color="red">✗</Text> {f.job} / {f.step}
                       </Text>
                       {f.lines.map(l => (
                         <Text dimColor>  {l}</Text>
