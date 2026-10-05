@@ -1,0 +1,35 @@
+name: Sample Pipeline
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: sleep 8
+      - name: Compile
+        run: sleep 10
+      - name: Package
+        run: sleep 6
+
+  test:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: sleep 12
+      - name: Integration tests
+        run: sleep 12
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Deploy to staging
+        run: sleep 10
+      - name: Smoke test
+        run: sleep 6
