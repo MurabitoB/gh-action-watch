@@ -1,5 +1,19 @@
-export type Step = { name: string; status: string; conclusion: string | null }
-export type Job = { name: string; status: string; conclusion: string | null; steps: Step[] }
+export type Step = {
+  name: string
+  status: string
+  conclusion: string | null
+  startedAt: number | null
+  completedAt: number | null
+}
+export type Job = {
+  name: string
+  status: string
+  conclusion: string | null
+  startedAt: number | null
+  completedAt: number | null
+  steps: Step[]
+}
+export type Failure = { job: string; step: string; lines: string[] }
 export type Node = {
   id: string
   label: string
@@ -17,6 +31,8 @@ export type Run = {
   conclusion: string | null
   url: string
   nodes: Node[]
+  startedAt: number | null
+  failures: Failure[]
 }
 export type Watch = { run: Run | null; note: string }
 

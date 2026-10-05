@@ -2,6 +2,11 @@ name: Sample Pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      fail:
+        description: Make the smoke test fail
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -50,4 +55,9 @@ jobs:
       - name: Deploy to staging
         run: sleep 10
       - name: Smoke test
-        run: sleep 6
+        run: |
+          sleep 6
+          if [ "${{ inputs.fail }}" = "true" ]; then
+            echo "smoke test failed: expected 200, got 503"
+            exit 1
+          fi
