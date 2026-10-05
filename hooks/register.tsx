@@ -8,6 +8,8 @@ const POLL_MS = 3000
 const FIND_TRIES = 20
 const LOG_TAIL = 20
 const TRIGGER = /\bgh\s+workflow\s+run\b/
+const TRIGGER_RERUN = /\bgh\s+run\s+rerun\b/
+const TRIGGER_PUSH = /\bgit\s+push\b/
 const TRIGGER_PR = /\bgh\s+pr\s+create\b/
 const PR_URL = /https?:\/\/\S+\/pull\/\d+/
 
@@ -15,6 +17,9 @@ const watch = atom({ plugin: 'gh-action-watch', key: 'watch' } as const, {
   runs: [],
   note: 'No run yet. Trigger one with `gh workflow run` or `gh pr create`, or /gh-actions <run-id>.',
 } as Watch)
+
+// 0: every run stacked; otherwise the id of the one run shown.
+const view = atom({ plugin: 'gh-action-watch', key: 'view' } as const, 0)
 
 const icon = (status: string, conclusion: string | null) => {
   if (status === 'completed') {
@@ -215,7 +220,7 @@ function lastEnd(run: Run): number | null {
 }
 
 let cachedRepo: { host: string; slug: string } | undefined | null
-const failuresCache: Record<number, Failure[]> = {}
+const failuresCache: Record<string, Failure[]> = {}
 const defsCache: Record<number, Def[]> = {}
 
 let timer: { cancel: () => void } | undefined
@@ -281,20 +286,21 @@ async function loadDefs($: any, id: number): Promise<Def[]> {
 }
 
 // Failed steps' log tails, fetched once when the run has finished unsuccessfully.
-async function loadFailures($: any, id: number): Promise<Failure[]> {
-  if (failuresCache[id]) return failuresCache[id]
+async function loadFailures($: any, id: number, attempt: number): Promise<Failure[]> {
+  const key = `${id}:${attempt}`
+  if (failuresCache[key]) return failuresCache[key]
   let failures: Failure[] = []
   try {
     failures = parseFailedLog(await ghText($, ['run', 'view', String(id), '--log-failed']))
   } catch {
     failures = []
   }
-  failuresCache[id] = failures
+  failuresCache[key] = failures
   return failures
 }
 
 async function fetchRun($: any, id: number): Promise<Run> {
-  const r = await gh($, ['run', 'view', String(id), '--json', 'databaseId,workflowName,displayTitle,status,conclusion,url,startedAt,jobs'])
+  const r = await gh($, ['run', 'view', String(id), '--json', 'databaseId,workflowName,displayTitle,status,conclusion,url,startedAt,attempt,jobs'])
   const defs = await loadDefs($, id)
   const jobs: Job[] = (r.jobs ?? []).map((j: any) => ({
     name: j.name,
@@ -321,8 +327,32 @@ async function fetchRun($: any, id: number): Promise<Run> {
     url: r.url,
     startedAt: ms(r.startedAt),
     nodes: buildNodes(defs, jobs),
-    failures: isBad ? await loadFailures($, id) : [],
+    attempt: r.attempt ?? 1,
+    failures: isBad ? await loadFailures($, id, r.attempt ?? 1) : [],
   }
+}
+
+async function headSha($: any): Promise<string> {
+  const out = await $.process.run(['git', 'rev-parse', 'HEAD'])
+  if (out.exitCode !== 0) throw new Error(out.stderr.trim() || 'git rev-parse failed')
+  return out.stdout.trim()
+}
+
+// Ids of the runs the pane shows now.
+async function trackedIds($: any): Promise<number[]> {
+  return (await read($, watch)).runs.map(r => r.id)
+}
+
+// Re-run a finished run (`--failed`: only its failed jobs), then keep following the pane's runs.
+async function rerun($: any, id: number, failedOnly: boolean) {
+  const out = await $.process.run(['gh', 'run', 'rerun', String(id), ...(failedOnly ? ['--failed'] : [])])
+  if (out.exitCode !== 0) {
+    await update($, watch, w => ({ ...w, note: `rerun failed: ${out.stderr.trim()}` }))
+    return
+  }
+  const ids = await trackedIds($)
+  await update($, watch, w => ({ ...w, note: `Re-running #${id}…` }))
+  follow($, { kind: 'ids', ids: ids.includes(id) ? ids : [...ids, id], minTicks: 3 })
 }
 
 // Run ids a PR's head commit (or a commit sha) has produced so far.
@@ -333,10 +363,11 @@ async function runsForCommit($: any, sha: string): Promise<number[]> {
 
 type Source =
   | { kind: 'dispatch'; baseline: number; since: number }
-  | { kind: 'ids'; ids: number[] }
+  | { kind: 'ids'; ids: number[]; minTicks?: number }
   | { kind: 'pr'; pr: string }
+  | { kind: 'head' }
 
-const reported: Record<number, boolean> = {}
+const reported: Record<string, boolean> = {}
 
 // Follow runs until all complete. dispatch: the run triggered after `baseline` (-1: unknown, `since` decides);
 // pr: every run the PR's head commit produces.
@@ -345,6 +376,7 @@ function follow($: any, source: Source) {
   let ids: number[] = source.kind === 'ids' ? source.ids : []
   let sha: string | null = null
   let ticks = 0
+  let isOpened = source.kind !== 'head'
   timer = $.clock.every(POLL_MS, async () => {
     if (busy) return
     busy = true
@@ -357,41 +389,51 @@ function follow($: any, source: Source) {
         )
         if (hit) ids = [hit.databaseId]
       }
-      if (source.kind === 'pr') {
-        if (sha === null) {
+      if (source.kind === 'pr' || source.kind === 'head') {
+        if (sha === null && source.kind === 'pr') {
           const pr = await gh($, ['pr', 'view', ...(source.pr ? [source.pr] : []), '--json', 'headRefOid,number'])
           sha = pr.headRefOid
         }
+        if (sha === null) sha = await headSha($)
         const found = await runsForCommit($, sha as string)
         ids = [...ids, ...found.filter(x => !ids.includes(x))]
       }
       if (ids.length === 0) {
         if (ticks >= FIND_TRIES) {
           stop()
-          await update($, watch, () => ({ runs: [], note: 'Could not find a triggered run.' }))
-        } else {
+          if (source.kind !== 'head') await update($, watch, () => ({ runs: [], note: 'Could not find a triggered run.' }))
+        } else if (source.kind !== 'head') {
           await update($, watch, () => ({ runs: [], note: 'Waiting for a run to appear…' }))
         }
         return
+      }
+      if (!isOpened) {
+        isOpened = true
+        await $.ui.open({ id: PANE, title: 'GitHub Actions' })
       }
       const runs: Run[] = []
       for (const id of [...ids].sort((a, b) => a - b)) runs.push(await fetchRun($, id))
       await update($, watch, () => ({ runs, note: '' }))
       for (const run of runs) {
-        if (run.status === 'completed' && !reported[run.id]) {
-          reported[run.id] = true
+        if (run.status === 'completed' && !reported[`${run.id}:${run.attempt}`]) {
+          reported[`${run.id}:${run.attempt}`] = true
           $.ui.toast(`${run.name}: ${run.conclusion}`)
           await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: summarize(run) }] } })
         }
       }
       const open = runs.filter(r => r.status !== 'completed')
-      if (open.length === 0 && (source.kind !== 'pr' || ticks >= 5)) {
+      const minTicks = source.kind === 'ids' ? (source.minTicks ?? 0) : source.kind === 'dispatch' ? 0 : 5
+      if (open.length === 0 && ticks >= minTicks) {
         stop()
         $.ui.status(undefined)
       } else if (open.length > 0) {
         $.ui.status(`Actions: ${open.length} running (${open[0].name})`)
       }
     } catch (err) {
+      if (source.kind === 'head' && ids.length === 0) {
+        stop() // a push to a repo without Actions: stay out of the way
+        return
+      }
       await update($, watch, w => ({ ...w, note: `gh error: ${(err as Error).message}` }))
     } finally {
       busy = false
@@ -421,27 +463,55 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const isDispatch = TRIGGER.test(e.command)
     const isPr = TRIGGER_PR.test(e.command)
+    const isRerun = TRIGGER_RERUN.test(e.command)
+    const isPush = TRIGGER_PUSH.test(e.command)
     const since = await $.clock.now()
     const baseline = isDispatch ? await latestRunId($) : -1
     const ran = await next(e)
-    if ((isDispatch || isPr) && ran.deny === undefined && !ran.isError) {
+    const isOk = ran.deny === undefined && !ran.isError
+    if ((isDispatch || isPr) && isOk) {
       await $.ui.open({ id: PANE, title: 'GitHub Actions' })
       await update($, watch, () => ({ runs: [], note: 'Waiting for a run to appear…' }))
       if (isDispatch) follow($, { kind: 'dispatch', baseline, since })
       else follow($, { kind: 'pr', pr: PR_URL.exec(ran.text ?? '')?.[0] ?? '' })
+    } else if (isRerun && isOk) {
+      const given = Number(/\brerun\s+(\d+)/.exec(e.command)?.[1])
+      const id = given || (await latestRunId($))
+      if (id > 0) {
+        const ids = await trackedIds($)
+        await $.ui.open({ id: PANE, title: 'GitHub Actions' })
+        follow($, { kind: 'ids', ids: ids.includes(id) ? ids : [...ids, id], minTicks: 3 })
+      }
+    } else if (isPush && isOk) {
+      follow($, { kind: 'head' })
     }
     return ran
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text } = $.ui.resolve(e)
-    const { runs, note } = await read($, watch)
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const { runs: all, note } = await read($, watch)
+    const picked = await read($, view)
+    const runs = all.filter(r => picked === 0 || r.id === picked)
+    const shown = runs.length > 0 ? runs : all
     const now = await $.clock.now()
 
     return (
       <Box flexDirection="column">
         {note !== '' && <Text dimColor>{note}</Text>}
-        {runs.map((run, runIndex) => {
+        {all.length > 1 && (
+          <Box>
+            <Button key="tab-all" label={picked === 0 || runs.length === 0 ? '[ All ]' : 'All'} onPress={() => update($, view, () => 0)} />
+            {all.map(r => (
+              <Button
+                key={`tab-${r.id}`}
+                label={`${picked === r.id ? '[' : ' '}${icon(r.status, r.conclusion)} ${r.name}${picked === r.id ? ']' : ' '}`}
+                onPress={() => update($, view, () => r.id)}
+              />
+            ))}
+          </Box>
+        )}
+        {shown.map((run, runIndex) => {
           const levels: Node[][] = []
           for (const n of run.nodes) (levels[n.level] ??= []).push(n)
           const stages = levels.filter(Boolean)
@@ -454,6 +524,14 @@ export const register: Register = on => {
                 </Text>
               )}
               {run && <Text dimColor>{run.url}</Text>}
+              {run.status === 'completed' && (
+                <Box>
+                  {run.conclusion !== 'success' && run.conclusion !== 'skipped' && (
+                    <Button key={`rerun-failed-${run.id}`} label="↻ Rerun failed" onPress={() => rerun($, run.id, true)} />
+                  )}
+                  <Button key={`rerun-${run.id}`} label="↻ Rerun all" onPress={() => rerun($, run.id, false)} />
+                </Box>
+              )}
               {stages.length > 0 && (
                 <Box flexDirection="column" marginTop={1}>
                   <Text bold>Graph</Text>

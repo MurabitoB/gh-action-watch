@@ -30,6 +30,7 @@ export type Run = {
   status: string
   conclusion: string | null
   url: string
+  attempt: number
   nodes: Node[]
   startedAt: number | null
   failures: Failure[]
@@ -38,6 +39,6 @@ export type Watch = { runs: Run[]; note: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'gh-action-watch': { watch: Watch }
+    'gh-action-watch': { watch: Watch; view: number }
   }
 }
