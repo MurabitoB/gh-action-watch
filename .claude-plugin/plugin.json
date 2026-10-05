@@ -1,0 +1,1 @@
+{ "name": "gh-action-watch", "version": "0.1.0", "description": "Side pane that live-renders the jobs and steps of a GitHub Actions run triggered via gh workflow run", "types": "./types/index.d.ts" }
