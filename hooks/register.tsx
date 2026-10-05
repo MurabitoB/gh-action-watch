@@ -120,7 +120,7 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const since = await $.clock.now()
     const ran = await next(e)
-    if (TRIGGER.test(e.input.command) && !('deny' in ran && ran.deny) && !ran.isError) {
+    if (TRIGGER.test(e.command) && ran.deny === undefined && !ran.isError) {
       await $.ui.open({ id: PANE, title: 'GitHub Actions' })
       await update($, watch, () => ({ run: null, note: 'Waiting for the run to appear…' }))
       follow($, null, since)
