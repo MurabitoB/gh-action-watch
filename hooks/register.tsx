@@ -179,7 +179,7 @@ function dur(startedAt: number | null, completedAt: number | null, now: number) 
 // `gh run view --log-failed` prints `job<TAB>step<TAB>timestamp line`; keep each step's tail.
 function parseFailedLog(text: string): Failure[] {
   const out: Failure[] = []
-  for (const raw of text.replace(/﻿/g, '').replace(/\u001b\[[0-9;]*m/g, '').split('\n')) {
+  for (const raw of text.replace(/﻿/g, '').replace(/(?:\u001b|\^\[)\[[0-9;]*m/g, '').split('\n')) {
     const parts = raw.split('\t')
     if (parts.length < 3) continue
     const line = parts
