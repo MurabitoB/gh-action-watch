@@ -8,10 +8,12 @@ const POLL_MS = 3000
 const FIND_TRIES = 20
 const LOG_TAIL = 20
 const TRIGGER = /\bgh\s+workflow\s+run\b/
+const TRIGGER_PR = /\bgh\s+pr\s+create\b/
+const PR_URL = /https?:\/\/\S+\/pull\/\d+/
 
 const watch = atom({ plugin: 'gh-action-watch', key: 'watch' } as const, {
-  run: null,
-  note: 'No run yet. Trigger one with `gh workflow run`, or /gh-actions <run-id>.',
+  runs: [],
+  note: 'No run yet. Trigger one with `gh workflow run` or `gh pr create`, or /gh-actions <run-id>.',
 } as Watch)
 
 const icon = (status: string, conclusion: string | null) => {
@@ -172,10 +174,15 @@ function dur(startedAt: number | null, completedAt: number | null, now: number) 
 // `gh run view --log-failed` prints `job<TAB>step<TAB>timestamp line`; keep each step's tail.
 function parseFailedLog(text: string): Failure[] {
   const out: Failure[] = []
-  for (const raw of text.split('\n')) {
-    const parts = raw.replace(/^﻿/, '').split('\t')
+  for (const raw of text.replace(/﻿/g, '').replace(/\u001b\[[0-9;]*m/g, '').split('\n')) {
+    const parts = raw.split('\t')
     if (parts.length < 3) continue
-    const line = parts.slice(2).join('\t').replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '')
+    const line = parts
+      .slice(2)
+      .join('\t')
+      .replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, '')
+      .replace(/^##\[error\]/, 'error: ')
+    if (/^##\[(end)?group\]/.test(line) || line.trim() === '') continue
     let f = out.find(x => x.job === parts[0] && x.step === parts[1])
     if (!f) {
       f = { job: parts[0], step: parts[1], lines: [] }
@@ -208,8 +215,8 @@ function lastEnd(run: Run): number | null {
 }
 
 let cachedRepo: { host: string; slug: string } | undefined | null
-let cachedFailures: { runId: number; failures: Failure[] } | undefined
-let cachedDefs: { runId: number; defs: Def[] } | undefined
+const failuresCache: Record<number, Failure[]> = {}
+const defsCache: Record<number, Def[]> = {}
 
 let timer: { cancel: () => void } | undefined
 let busy = false
@@ -256,7 +263,7 @@ async function latestRunId($: any): Promise<number> {
 
 // The API does not expose `needs`, so read the workflow file at the run's commit (once per run).
 async function loadDefs($: any, id: number): Promise<Def[]> {
-  if (cachedDefs?.runId === id) return cachedDefs.defs
+  if (defsCache[id]) return defsCache[id]
   let defs: Def[] = []
   try {
     const repo = await repoInfo($)
@@ -269,20 +276,20 @@ async function loadDefs($: any, id: number): Promise<Def[]> {
   } catch {
     defs = []
   }
-  cachedDefs = { runId: id, defs }
+  defsCache[id] = defs
   return defs
 }
 
 // Failed steps' log tails, fetched once when the run has finished unsuccessfully.
 async function loadFailures($: any, id: number): Promise<Failure[]> {
-  if (cachedFailures?.runId === id) return cachedFailures.failures
+  if (failuresCache[id]) return failuresCache[id]
   let failures: Failure[] = []
   try {
     failures = parseFailedLog(await ghText($, ['run', 'view', String(id), '--log-failed']))
   } catch {
     failures = []
   }
-  cachedFailures = { runId: id, failures }
+  failuresCache[id] = failures
   return failures
 }
 
@@ -318,38 +325,71 @@ async function fetchRun($: any, id: number): Promise<Run> {
   }
 }
 
-// Follow one run until it completes. `runId` null: locate the run triggered after `baseline`
-// (the newest run id before the trigger; -1 when unknown, then `since` decides).
-function follow($: any, runId: number | null, since: number, baseline: number) {
+// Run ids a PR's head commit (or a commit sha) has produced so far.
+async function runsForCommit($: any, sha: string): Promise<number[]> {
+  const list = await gh($, ['run', 'list', '--commit', sha, '--limit', '20', '--json', 'databaseId'])
+  return list.map((r: any) => r.databaseId)
+}
+
+type Source =
+  | { kind: 'dispatch'; baseline: number; since: number }
+  | { kind: 'ids'; ids: number[] }
+  | { kind: 'pr'; pr: string }
+
+const reported: Record<number, boolean> = {}
+
+// Follow runs until all complete. dispatch: the run triggered after `baseline` (-1: unknown, `since` decides);
+// pr: every run the PR's head commit produces.
+function follow($: any, source: Source) {
   stop()
-  let id = runId
-  let tries = 0
+  let ids: number[] = source.kind === 'ids' ? source.ids : []
+  let sha: string | null = null
+  let ticks = 0
   timer = $.clock.every(POLL_MS, async () => {
     if (busy) return
     busy = true
     try {
-      if (id === null) {
-        tries++
+      ticks++
+      if (source.kind === 'dispatch' && ids.length === 0) {
         const list = await gh($, ['run', 'list', '--event', 'workflow_dispatch', '--limit', '5', '--json', 'databaseId,createdAt'])
-        const hit = list.find((r: any) => (baseline >= 0 ? r.databaseId > baseline : Date.parse(r.createdAt) >= since - 10000))
-        if (hit) id = hit.databaseId
-        else if (tries >= FIND_TRIES) {
-          stop()
-          await update($, watch, () => ({ run: null, note: 'Could not find the triggered run.' }))
-        } else {
-          await update($, watch, () => ({ run: null, note: 'Waiting for the run to appear…' }))
-        }
-        if (id === null) return
+        const hit = list.find((r: any) =>
+          source.baseline >= 0 ? r.databaseId > source.baseline : Date.parse(r.createdAt) >= source.since - 10000,
+        )
+        if (hit) ids = [hit.databaseId]
       }
-      const run = await fetchRun($, id)
-      await update($, watch, () => ({ run, note: '' }))
-      if (run.status === 'completed') {
+      if (source.kind === 'pr') {
+        if (sha === null) {
+          const pr = await gh($, ['pr', 'view', ...(source.pr ? [source.pr] : []), '--json', 'headRefOid,number'])
+          sha = pr.headRefOid
+        }
+        const found = await runsForCommit($, sha as string)
+        ids = [...ids, ...found.filter(x => !ids.includes(x))]
+      }
+      if (ids.length === 0) {
+        if (ticks >= FIND_TRIES) {
+          stop()
+          await update($, watch, () => ({ runs: [], note: 'Could not find a triggered run.' }))
+        } else {
+          await update($, watch, () => ({ runs: [], note: 'Waiting for a run to appear…' }))
+        }
+        return
+      }
+      const runs: Run[] = []
+      for (const id of [...ids].sort((a, b) => a - b)) runs.push(await fetchRun($, id))
+      await update($, watch, () => ({ runs, note: '' }))
+      for (const run of runs) {
+        if (run.status === 'completed' && !reported[run.id]) {
+          reported[run.id] = true
+          $.ui.toast(`${run.name}: ${run.conclusion}`)
+          await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: summarize(run) }] } })
+        }
+      }
+      const open = runs.filter(r => r.status !== 'completed')
+      if (open.length === 0 && (source.kind !== 'pr' || ticks >= 5)) {
         stop()
-        $.ui.toast(`${run.name}: ${run.conclusion}`)
         $.ui.status(undefined)
-        await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: summarize(run) }] } })
-      } else {
-        $.ui.status(`Actions: ${run.name} ${run.status}`)
+      } else if (open.length > 0) {
+        $.ui.status(`Actions: ${open.length} running (${open[0].name})`)
       }
     } catch (err) {
       await update($, watch, w => ({ ...w, note: `gh error: ${(err as Error).message}` }))
@@ -358,7 +398,6 @@ function follow($: any, runId: number | null, since: number, baseline: number) {
     }
   })
 }
-
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -373,113 +412,122 @@ export const register: Register = on => {
     await $.ui.open({ id: PANE, title: 'GitHub Actions' })
     const id = Number(e.args.trim())
     if (id) {
-      await update($, watch, () => ({ run: null, note: `Loading run ${id}…` }))
-      follow($, id, 0, -1)
+      await update($, watch, () => ({ runs: [], note: `Loading run ${id}…` }))
+      follow($, { kind: 'ids', ids: [id] })
     }
     return { text: 'GitHub Actions pane opened.' }
   })
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    const isTrigger = TRIGGER.test(e.command)
+    const isDispatch = TRIGGER.test(e.command)
+    const isPr = TRIGGER_PR.test(e.command)
     const since = await $.clock.now()
-    const baseline = isTrigger ? await latestRunId($) : -1
+    const baseline = isDispatch ? await latestRunId($) : -1
     const ran = await next(e)
-    if (isTrigger && ran.deny === undefined && !ran.isError) {
+    if ((isDispatch || isPr) && ran.deny === undefined && !ran.isError) {
       await $.ui.open({ id: PANE, title: 'GitHub Actions' })
-      await update($, watch, () => ({ run: null, note: 'Waiting for the run to appear…' }))
-      follow($, null, since, baseline)
+      await update($, watch, () => ({ runs: [], note: 'Waiting for a run to appear…' }))
+      if (isDispatch) follow($, { kind: 'dispatch', baseline, since })
+      else follow($, { kind: 'pr', pr: PR_URL.exec(ran.text ?? '')?.[0] ?? '' })
     }
     return ran
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
-    const { run, note } = await read($, watch)
+    const { runs, note } = await read($, watch)
     const now = await $.clock.now()
-    const levels: Node[][] = []
-    for (const n of run?.nodes ?? []) (levels[n.level] ??= []).push(n)
-    const stages = levels.filter(Boolean)
 
     return (
       <Box flexDirection="column">
-        {run && (
-          <Text bold>
-            {icon(run.status, run.conclusion)} {run.name} #{run.id} ({run.conclusion ?? run.status}){dur(run.startedAt, run.status === 'completed' ? lastEnd(run) : null, now)}
-          </Text>
-        )}
-        {run && <Text dimColor>{run.url}</Text>}
         {note !== '' && <Text dimColor>{note}</Text>}
-        {stages.length > 0 && (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>Graph</Text>
-            {stages.map((stage, i) => (
-              <Box flexDirection="column">
-                {i > 0 && <Text dimColor>  │</Text>}
-                {stage.map((n, k) => (
-                  <Text>
-                    {i > 0 ? (k === 0 ? '  ▼ ' : '  │ ') : '    '}
-                    {icon(n.status, n.conclusion)} {n.id}
-                    {n.isMatrix ? ` ⟨matrix ${n.instances.filter(j => j.status === 'completed').length}/${n.instances.length}⟩` : ''}
-                    {n.needs.length > 0 ? `  ← ${n.needs.join(', ')}` : ''}
-                  </Text>
-                ))}
-              </Box>
-            ))}
-          </Box>
-        )}
-        {stages.map((stage, i) => (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold dimColor>
-              Stage {i + 1}{stage.length > 1 ? ' (parallel)' : ''}
-            </Text>
-            {stage.map(n => (
-              <Box flexDirection="column">
+        {runs.map((run, runIndex) => {
+          const levels: Node[][] = []
+          for (const n of run.nodes) (levels[n.level] ??= []).push(n)
+          const stages = levels.filter(Boolean)
+
+          return (
+            <Box flexDirection="column" marginTop={runIndex > 0 ? 1 : 0}>
+              {run && (
                 <Text bold>
-                  {icon(n.status, n.conclusion)} {n.label}
-                  {n.isMatrix ? ' ⟨matrix⟩' : ''}
-                  {n.instances.length === 1 ? dur(n.instances[0].startedAt, n.instances[0].completedAt, now) : ''}
+                  {icon(run.status, run.conclusion)} {run.name} #{run.id} ({run.conclusion ?? run.status}){dur(run.startedAt, run.status === 'completed' ? lastEnd(run) : null, now)}
                 </Text>
-                {n.instances.length === 0 && <Text dimColor>  waiting on {n.needs.join(', ') || 'trigger'}</Text>}
-                {n.instances.map((job, k) => {
-                  const last = k === n.instances.length - 1
-                  const showSteps = !n.isMatrix || job.status !== 'completed'
-                  return (
+              )}
+              {run && <Text dimColor>{run.url}</Text>}
+              {stages.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  <Text bold>Graph</Text>
+                  {stages.map((stage, i) => (
                     <Box flexDirection="column">
-                      {n.isMatrix && (
+                      {i > 0 && <Text dimColor>  │</Text>}
+                      {stage.map((n, k) => (
                         <Text>
-                          {last ? '  └─ ' : '  ├─ '}
-                          {icon(job.status, job.conclusion)} {job.name}{dur(job.startedAt, job.completedAt, now)}
+                          {i > 0 ? (k === 0 ? '  ▼ ' : '  │ ') : '    '}
+                          {icon(n.status, n.conclusion)} {n.id}
+                          {n.isMatrix ? ` ⟨matrix ${n.instances.filter(j => j.status === 'completed').length}/${n.instances.length}⟩` : ''}
+                          {n.needs.length > 0 ? `  ← ${n.needs.join(', ')}` : ''}
                         </Text>
-                      )}
-                      {showSteps &&
-                        job.steps.map(step => (
-                          <Text dimColor={step.status === 'completed' || step.status === 'queued'}>
-                            {n.isMatrix ? (last ? '       ' : '  │    ') : '  '}
-                            {icon(step.status, step.conclusion)} {step.name}{dur(step.startedAt, step.completedAt, now)}
-                          </Text>
-                        ))}
+                      ))}
                     </Box>
-                  )
-                })}
-              </Box>
-            ))}
-          </Box>
-        ))}
-        {run && run.failures.length > 0 && (
-          <Box flexDirection="column" marginTop={1}>
-            <Text bold>Failed logs</Text>
-            {run.failures.map(f => (
-              <Box flexDirection="column">
-                <Text bold>
-                  ✗ {f.job} / {f.step}
-                </Text>
-                {f.lines.map(l => (
-                  <Text dimColor>  {l}</Text>
-                ))}
-              </Box>
-            ))}
-          </Box>
-        )}
+                  ))}
+                </Box>
+              )}
+              {stages.map((stage, i) => (
+                <Box flexDirection="column" marginTop={1}>
+                  <Text bold dimColor>
+                    Stage {i + 1}{stage.length > 1 ? ' (parallel)' : ''}
+                  </Text>
+                  {stage.map(n => (
+                    <Box flexDirection="column">
+                      <Text bold>
+                        {icon(n.status, n.conclusion)} {n.label}
+                        {n.isMatrix ? ' ⟨matrix⟩' : ''}
+                        {n.instances.length === 1 ? dur(n.instances[0].startedAt, n.instances[0].completedAt, now) : ''}
+                      </Text>
+                      {n.instances.length === 0 && <Text dimColor>  waiting on {n.needs.join(', ') || 'trigger'}</Text>}
+                      {n.instances.map((job, k) => {
+                        const last = k === n.instances.length - 1
+                        const showSteps = !n.isMatrix || job.status !== 'completed'
+                        return (
+                          <Box flexDirection="column">
+                            {n.isMatrix && (
+                              <Text>
+                                {last ? '  └─ ' : '  ├─ '}
+                                {icon(job.status, job.conclusion)} {job.name}{dur(job.startedAt, job.completedAt, now)}
+                              </Text>
+                            )}
+                            {showSteps &&
+                              job.steps.map(step => (
+                                <Text dimColor={step.status === 'completed' || step.status === 'queued'}>
+                                  {n.isMatrix ? (last ? '       ' : '  │    ') : '  '}
+                                  {icon(step.status, step.conclusion)} {step.name}{dur(step.startedAt, step.completedAt, now)}
+                                </Text>
+                              ))}
+                          </Box>
+                        )
+                      })}
+                    </Box>
+                  ))}
+                </Box>
+              ))}
+              {run && run.failures.length > 0 && (
+                <Box flexDirection="column" marginTop={1}>
+                  <Text bold>Failed logs</Text>
+                  {run.failures.map(f => (
+                    <Box flexDirection="column">
+                      <Text bold>
+                        ✗ {f.job} / {f.step}
+                      </Text>
+                      {f.lines.map(l => (
+                        <Text dimColor>  {l}</Text>
+                      ))}
+                    </Box>
+                  ))}
+                </Box>
+              )}
+            </Box>
+          )
+        })}
       </Box>
     )
   })

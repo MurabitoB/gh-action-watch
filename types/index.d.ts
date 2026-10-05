@@ -34,7 +34,7 @@ export type Run = {
   startedAt: number | null
   failures: Failure[]
 }
-export type Watch = { run: Run | null; note: string }
+export type Watch = { runs: Run[]; note: string }
 
 declare module 'claude-code' {
   interface PluginState {
